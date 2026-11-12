@@ -56,7 +56,7 @@ def list_loras():
         if names: db.execute("DELETE FROM loras WHERE name NOT IN (" + ",".join("?" for _ in names) + ")", names)
         else: db.execute("DELETE FROM loras")
         rows = db.execute("SELECT * FROM loras ORDER BY name COLLATE NOCASE").fetchall()
-    return [dict(name=r["name"], folder=str(Path(r["name"]).parent).replace("\\\\","/").replace(".","",1) if str(Path(r["name"]).parent)=="." else str(Path(r["name"]).parent).replace("\\\\","/"), size=r["size"], favorite=bool(r["favorite"]), metadata=json.loads(r["metadata"]) if r["metadata"] else None) for r in rows]
+    return [dict(name=r["name"], folder="" if str(Path(r["name"]).parent)=="." else str(Path(r["name"]).parent).replace(chr(92),"/"), size=r["size"], favorite=bool(r["favorite"]), metadata=json.loads(r["metadata"]) if r["metadata"] else None) for r in rows]
 
 def request_json(url):
     headers = {"User-Agent":"ComfyUI-LoraLibrary/0.1", "Accept":"application/json"}
@@ -130,9 +130,6 @@ def thumbnail(name):
     return target
 
 def batch_scan(force=False):
-    with SCAN_LOCK:
-        if SCAN_STATE["running"]: return
-        SCAN_STATE.update(running=True,done=0,total=0,errors=0)
     try:
         entries = list_loras()
         SCAN_STATE["total"] = len(entries)
@@ -175,9 +172,11 @@ def register_routes():
         return web.json_response(dict(SCAN_STATE))
     @routes.post("/lora-library/scan")
     async def scan(request):
-        if SCAN_STATE["running"]: return web.json_response(dict(SCAN_STATE))
         body=await request.json()
-        POOL.submit(batch_scan, bool(body.get("force")))
+        with SCAN_LOCK:
+            if SCAN_STATE["running"]: return web.json_response(dict(SCAN_STATE))
+            SCAN_STATE.update(running=True,done=0,total=0,errors=0)
+            POOL.submit(batch_scan, bool(body.get("force")))
         return web.json_response({"started":True})
     @routes.get("/lora-library/thumb")
     async def thumb(request):
