@@ -6,6 +6,9 @@ import os
 import sqlite3
 import threading
 import time
+import mimetypes
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -17,6 +20,12 @@ from server import PromptServer
 DATA = Path(os.environ.get("LORA_LIBRARY_DATA", str(Path(__file__).resolve().parent / ".library-data")))
 DATA.mkdir(parents=True, exist_ok=True)
 LOCK = threading.RLock()
+SCAN_LOCK = threading.Lock()
+SCAN_STATE = {"running": False, "done": 0, "total": 0, "errors": 0}
+POOL = ThreadPoolExecutor(max_workers=2)
+THUMBS = DATA / "thumbnails"
+THUMBS.mkdir(exist_ok=True)
+
 
 def database():
     db = sqlite3.connect(DATA / "library.sqlite3", timeout=30)
@@ -47,7 +56,7 @@ def list_loras():
         if names: db.execute("DELETE FROM loras WHERE name NOT IN (" + ",".join("?" for _ in names) + ")", names)
         else: db.execute("DELETE FROM loras")
         rows = db.execute("SELECT * FROM loras ORDER BY name COLLATE NOCASE").fetchall()
-    return [dict(name=r["name"], size=r["size"], favorite=bool(r["favorite"]), metadata=json.loads(r["metadata"]) if r["metadata"] else None) for r in rows]
+    return [dict(name=r["name"], folder=str(Path(r["name"]).parent).replace("\\\\","/").replace(".","",1) if str(Path(r["name"]).parent)=="." else str(Path(r["name"]).parent).replace("\\\\","/"), size=r["size"], favorite=bool(r["favorite"]), metadata=json.loads(r["metadata"]) if r["metadata"] else None) for r in rows]
 
 def request_json(url):
     headers = {"User-Agent":"ComfyUI-LoraLibrary/0.1", "Accept":"application/json"}
@@ -93,6 +102,61 @@ def resolve(name, refresh=False):
         db.execute("UPDATE loras SET metadata=?,checked=? WHERE name=?", (json.dumps(result), time.time(), name))
     return result
 
+
+def thumbnail(name):
+    """Fetch one small preview, with a strict size limit and allowlisted host."""
+    from urllib.parse import urlsplit
+    from urllib.request import urlopen
+    with LOCK, database() as db:
+        row = db.execute("SELECT sha,metadata FROM loras WHERE name=?", (name,)).fetchone()
+    if not row or not row["metadata"] or not row["sha"]: return None
+    data = json.loads(row["metadata"])
+    images = data.get("images") or []
+    if not images: return None
+    url = images[0].get("url","")
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in ("image.civitai.com","civitai.com"): return None
+    key = hashlib.sha256((row["sha"]+url).encode()).hexdigest()
+    target = THUMBS / (key + ".img")
+    if target.is_file(): return target
+    req = Request(url, headers={"User-Agent":"ComfyUI-LoraLibrary/0.2"})
+    with urlopen(req, timeout=12) as response:
+        content_type = response.headers.get("Content-Type","").split(";")[0]
+        if content_type not in ("image/jpeg","image/png","image/webp"): return None
+        payload = response.read(1_500_001)
+        if len(payload)>1_500_000: return None
+    target.write_bytes(payload)
+    (THUMBS / (key+".type")).write_text(content_type)
+    return target
+
+def batch_scan(force=False):
+    with SCAN_LOCK:
+        if SCAN_STATE["running"]: return
+        SCAN_STATE.update(running=True,done=0,total=0,errors=0)
+    try:
+        entries = list_loras()
+        SCAN_STATE["total"] = len(entries)
+        for entry in entries:
+            try:
+                resolve(entry["name"], refresh=force)
+                thumbnail(entry["name"])
+            except Exception:
+                SCAN_STATE["errors"] += 1
+            finally:
+                SCAN_STATE["done"] += 1
+    finally:
+        SCAN_STATE["running"] = False
+
+def cached_thumbnail(name):
+    with LOCK, database() as db:
+        row=db.execute("SELECT sha,metadata FROM loras WHERE name=?", (name,)).fetchone()
+    if not row or not row["sha"] or not row["metadata"]: return None
+    images=json.loads(row["metadata"]).get("images") or []
+    if not images: return None
+    key=hashlib.sha256((row["sha"]+images[0].get("url","")).encode()).hexdigest()
+    path=THUMBS/(key+".img")
+    return path if path.is_file() else None
+
 def register_routes():
     routes = PromptServer.instance.routes
     @routes.get("/lora-library/list")
@@ -106,6 +170,25 @@ def register_routes():
         except ValueError as e: return web.json_response({"error":str(e)},status=400)
         except (HTTPError,URLError,TimeoutError) as e: return web.json_response({"error":str(e)},status=502)
         except Exception: return web.json_response({"error":"Metadata lookup failed"},status=500)
+    @routes.get("/lora-library/scan-status")
+    async def scan_status(request):
+        return web.json_response(dict(SCAN_STATE))
+    @routes.post("/lora-library/scan")
+    async def scan(request):
+        if SCAN_STATE["running"]: return web.json_response(dict(SCAN_STATE))
+        body=await request.json()
+        POOL.submit(batch_scan, bool(body.get("force")))
+        return web.json_response({"started":True})
+    @routes.get("/lora-library/thumb")
+    async def thumb(request):
+        name=request.query.get("name","")
+        try:
+            local_file(name)
+            path=await asyncio.to_thread(cached_thumbnail,name)
+            if not path: raise web.HTTPNotFound()
+            media=(THUMBS/(path.stem+".type")).read_text() if (THUMBS/(path.stem+".type")).exists() else "image/jpeg"
+            return web.FileResponse(path,headers={"Content-Type":media,"Cache-Control":"private, max-age=3600"})
+        except ValueError: raise web.HTTPNotFound()
     @routes.post("/lora-library/favorite")
     async def favorite(request):
         try:
